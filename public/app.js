@@ -591,6 +591,15 @@ function render(clients, usage) {
     knob.className = "switch-knob";
     toggle.appendChild(knob);
     toggle.addEventListener("click", () => toggleDisabled(c.id, !disabled, toggle));
+    // ---- edit button, next to the switch ----
+    const editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.className = "head-edit";
+    editBtn.setAttribute("aria-label", "Edit this config");
+    editBtn.title = "Edit";
+    editBtn.innerHTML = ICONS.edit;
+    editBtn.addEventListener("click", () => openEditModal(c));
+    head.appendChild(editBtn);
     head.appendChild(toggle);
 
     const stats = document.createElement("div");
@@ -697,10 +706,6 @@ function render(clients, usage) {
     });
     deleteBtn.addEventListener("click", () => deleteClient(c.id));
 
-    const { btn: editBtn } = iconBtn({ icon: ICONS.edit, label: "Edit", ariaLabel: "Edit this config" });
-    editBtn.addEventListener("click", () => openEditModal(c));
-
-    actions.appendChild(editBtn);
     actions.appendChild(qrBtn);
     actions.appendChild(copyBtn);
     actions.appendChild(subBtn);
