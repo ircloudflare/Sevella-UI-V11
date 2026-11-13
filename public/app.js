@@ -3,18 +3,6 @@ let USAGE_SOCKET = null;
 let RECONNECT_TIMER = null;
 let LOGGING_OUT = false;
 
-// Card list is fully rebuilt every ~5s from the usage websocket, which would
-// otherwise snap any open "edit limit" box shut and wipe unsaved input while
-// the admin is mid-edit. These track which editors are open and what's been
-// typed into them so render() can restore that state across rebuilds.
-const OPEN_LIMIT_EDITORS = new Set();
-const LIMIT_DRAFTS = new Map(); // clientId -> { value: string, unit: "MB"|"GB"|"TB" }
-// Same idea for the "edit expiry" boxes.
-const OPEN_EXPIRY_EDITORS = new Set();
-const EXPIRY_DRAFTS = new Map(); // clientId -> days as typed (string)
-// Same idea for the "edit UUID" boxes.
-const OPEN_UUID_EDITORS = new Set();
-const UUID_DRAFTS = new Map(); // clientId -> UUID as typed (string)
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // The QR code now lives in a single modal appended to <body>, outside the
@@ -28,7 +16,7 @@ let QR_MODAL_LABEL = null;
 // If a websocket "usage" refresh lands while the admin has a limit-editor
 // input focused or has text selected inside the list, applying it right away
 // would blow away focus/selection (rebuilding the DOM always does that, even
-// though the *value* is preserved via LIMIT_DRAFTS). So we hold the latest
+// though typed values would be lost). So we hold the latest
 // snapshot here and flush it once the admin is done interacting.
 let PENDING_RENDER = null;
 
@@ -135,6 +123,8 @@ function copyToClipboard(text, btn, labelEl) {
 }
 
 const ICONS = {
+  edit:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"></path></svg>',
   qrcode:
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect><line x1="14" y1="14" x2="14" y2="21"></line><line x1="21" y1="14" x2="21" y2="14.01"></line><line x1="14" y1="17.5" x2="17.5" y2="17.5"></line><line x1="21" y1="21" x2="17.5" y2="21"></line><line x1="17.5" y1="17.5" x2="17.5" y2="21"></line></svg>',
   copy:
@@ -254,6 +244,253 @@ function openQrModal(link, label) {
 
 function closeQrModal() {
   if (QR_MODAL) QR_MODAL.classList.remove("is-open");
+}
+
+// ---------- edit window (single instance, lives outside #list) ----------
+// One window with every editable field and a single Save button. Only the fields
+// that actually changed are sent, in one PATCH, so the server restarts Xray once.
+let EDIT_MODAL = null;
+let EDIT_STATE = null; // { client, els }
+
+function field(labelText, control, hint) {
+  const wrap = document.createElement("div");
+  wrap.className = "edit-field";
+  const lab = document.createElement("label");
+  lab.className = "edit-label";
+  lab.textContent = labelText;
+  wrap.appendChild(lab);
+  wrap.appendChild(control);
+  if (hint) {
+    const h = document.createElement("p");
+    h.className = "edit-hint";
+    h.textContent = hint;
+    wrap.appendChild(h);
+  }
+  return wrap;
+}
+
+function ensureEditModal() {
+  if (EDIT_MODAL) return;
+
+  const overlay = document.createElement("div");
+  overlay.className = "qr-modal-overlay";
+  const modal = document.createElement("div");
+  modal.className = "qr-modal edit-modal";
+
+  const head = document.createElement("div");
+  head.className = "qr-modal-head";
+  const title = document.createElement("span");
+  title.className = "label";
+  title.textContent = "Edit config";
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "qr-modal-close";
+  closeBtn.innerHTML = "&times;";
+  closeBtn.setAttribute("aria-label", "Close");
+  closeBtn.addEventListener("click", closeEditModal);
+  head.appendChild(title);
+  head.appendChild(closeBtn);
+
+  const labelInput = document.createElement("input");
+  labelInput.type = "text";
+  labelInput.maxLength = 100;
+
+  const uuidInput = document.createElement("input");
+  uuidInput.type = "text";
+  uuidInput.spellcheck = false;
+  uuidInput.autocomplete = "off";
+  uuidInput.className = "uuid-input";
+  uuidInput.placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
+  const randomBtn = document.createElement("button");
+  randomBtn.type = "button";
+  randomBtn.className = "secondary";
+  randomBtn.textContent = "Random";
+  randomBtn.addEventListener("click", () => {
+    uuidInput.value = crypto.randomUUID();
+  });
+  const uuidRowEl = document.createElement("div");
+  uuidRowEl.className = "edit-inline";
+  uuidRowEl.appendChild(uuidInput);
+  uuidRowEl.appendChild(randomBtn);
+
+  const limitInput = document.createElement("input");
+  limitInput.type = "number";
+  limitInput.min = "0";
+  limitInput.step = "any";
+  limitInput.placeholder = "Unlimited";
+  const limitUnit = document.createElement("select");
+  ["MB", "GB", "TB"].forEach((u) => {
+    const opt = document.createElement("option");
+    opt.value = u;
+    opt.textContent = u;
+    limitUnit.appendChild(opt);
+  });
+  const limitRowEl = document.createElement("div");
+  limitRowEl.className = "edit-inline";
+  limitRowEl.appendChild(limitInput);
+  limitRowEl.appendChild(limitUnit);
+
+  const daysInput = document.createElement("input");
+  daysInput.type = "number";
+  daysInput.min = "1";
+  daysInput.step = "1";
+  const noExpiryBox = document.createElement("input");
+  noExpiryBox.type = "checkbox";
+  const noExpiryLab = document.createElement("label");
+  noExpiryLab.className = "edit-check";
+  noExpiryLab.appendChild(noExpiryBox);
+  noExpiryLab.appendChild(document.createTextNode(" No expiry"));
+  noExpiryBox.addEventListener("change", () => {
+    daysInput.disabled = noExpiryBox.checked;
+  });
+  const expiryRowEl = document.createElement("div");
+  expiryRowEl.className = "edit-inline";
+  expiryRowEl.appendChild(daysInput);
+  expiryRowEl.appendChild(noExpiryLab);
+
+  const enabledBox = document.createElement("input");
+  enabledBox.type = "checkbox";
+  const enabledLab = document.createElement("label");
+  enabledLab.className = "edit-check";
+  enabledLab.appendChild(enabledBox);
+  enabledLab.appendChild(document.createTextNode(" Enabled"));
+
+  const errorEl = document.createElement("p");
+  errorEl.className = "edit-error";
+  errorEl.hidden = true;
+
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.textContent = "Save";
+  saveBtn.addEventListener("click", saveEdit);
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "secondary";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", closeEditModal);
+  const footer = document.createElement("div");
+  footer.className = "edit-footer";
+  footer.appendChild(cancelBtn);
+  footer.appendChild(saveBtn);
+
+  const expiryField = field("Expiry", expiryRowEl, "-");
+  const expiryHint = expiryField.querySelector(".edit-hint");
+
+  modal.appendChild(head);
+  modal.appendChild(field("Label", labelInput));
+  modal.appendChild(field("UUID", uuidRowEl, "Changing it breaks the old config link right away."));
+  modal.appendChild(field("Data limit", limitRowEl, "Leave empty for unlimited."));
+  modal.appendChild(expiryField);
+  modal.appendChild(enabledLab);
+  modal.appendChild(errorEl);
+  modal.appendChild(footer);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) closeEditModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && overlay.classList.contains("is-open")) closeEditModal();
+  });
+
+  EDIT_MODAL = overlay;
+  EDIT_STATE = {
+    client: null,
+    els: { labelInput, uuidInput, limitInput, limitUnit, daysInput, noExpiryBox, enabledBox, errorEl, saveBtn, expiryHint },
+  };
+}
+
+function openEditModal(c) {
+  ensureEditModal();
+  const { els } = EDIT_STATE;
+  EDIT_STATE.client = c;
+
+  els.labelInput.value = c.label;
+  els.uuidInput.value = c.uuid;
+  const lim = bytesToUnit(c.dataLimitBytes);
+  els.limitInput.value = lim.value;
+  els.limitUnit.value = lim.unit;
+  els.daysInput.value = "";
+  els.noExpiryBox.checked = false;
+  els.daysInput.disabled = false;
+  els.daysInput.placeholder = c.expiresAt ? "Days from today (renew)" : "Days from today";
+  els.expiryHint.textContent = c.expiresAt
+    ? `Currently ends ${formatDate(c.expiresAt)}. Leave empty to keep it, or enter days to set a new end date.`
+    : "Currently no expiry. Enter days to set one.";
+  els.enabledBox.checked = !c.disabled;
+  els.errorEl.hidden = true;
+  els.saveBtn.disabled = false;
+
+  EDIT_MODAL.classList.add("is-open");
+  els.labelInput.focus();
+}
+
+function closeEditModal() {
+  if (EDIT_MODAL) EDIT_MODAL.classList.remove("is-open");
+}
+
+function editError(msg) {
+  const { errorEl } = EDIT_STATE.els;
+  errorEl.textContent = msg;
+  errorEl.hidden = false;
+}
+
+async function saveEdit() {
+  const { client: c, els } = EDIT_STATE;
+  const body = {};
+
+  const label = els.labelInput.value.trim();
+  if (!label) return editError("Label cannot be empty.");
+  if (label !== c.label) body.label = label;
+
+  const uuid = els.uuidInput.value.trim().toLowerCase();
+  if (!UUID_RE.test(uuid)) return editError("Enter a valid UUID (8-4-4-4-12 hex characters).");
+  if (uuid !== String(c.uuid).toLowerCase()) body.uuid = uuid;
+
+  const rawLimit = els.limitInput.value.trim();
+  let limitBytes = null;
+  if (rawLimit) {
+    limitBytes = Math.round(parseFloat(rawLimit) * UNIT_BYTES[els.limitUnit.value]);
+    if (!Number.isFinite(limitBytes) || limitBytes <= 0) return editError("Enter a valid positive data limit, or leave it empty.");
+  }
+  if (limitBytes !== (c.dataLimitBytes ?? null)) body.dataLimitBytes = limitBytes;
+
+  if (els.noExpiryBox.checked) {
+    if (c.expiresAt) body.expiryDays = null;
+  } else if (els.daysInput.value.trim()) {
+    const days = parseFloat(els.daysInput.value);
+    if (!Number.isFinite(days) || days <= 0) return editError("Enter a valid positive number of days.");
+    body.expiryDays = days;
+  }
+
+  const disabled = !els.enabledBox.checked;
+  if (disabled !== !!c.disabled) body.disabled = disabled;
+
+  if (Object.keys(body).length === 0) {
+    closeEditModal();
+    return;
+  }
+  if (body.uuid && !confirm("Change this UUID? The old config link will stop working right away.")) return;
+
+  els.saveBtn.disabled = true;
+  els.errorEl.hidden = true;
+  try {
+    const res = await api("/api/clients/" + c.id, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      editError(data.error || "Could not save the changes.");
+      return;
+    }
+    closeEditModal();
+    await loadClients();
+  } finally {
+    els.saveBtn.disabled = false;
+  }
 }
 
 // ---------- interaction guard: don't let background refreshes clobber
@@ -389,10 +626,9 @@ function render(clients, usage) {
       usageBarTrack.appendChild(fill);
     }
 
-    // ---- data limit row ----
+    // ---- data limit row (read-only; everything is edited in the Edit window) ----
     const limitRow = document.createElement("div");
     limitRow.className = "client-limit-row";
-
     const limitLabel = document.createElement("span");
     if (c.dataLimitBytes == null) {
       limitLabel.textContent = "Unlimited";
@@ -406,77 +642,11 @@ function render(clients, usage) {
       const remaining = Math.max(0, c.dataLimitBytes - clientUsage.total);
       limitLabel.textContent = `${formatBytes(remaining)} remaining of ${formatBytes(c.dataLimitBytes)}`;
     }
-
-    const limitEditLink = document.createElement("button");
-    limitEditLink.className = "limit-edit-link";
-    limitEditLink.type = "button";
-    limitEditLink.textContent = "Edit";
-    limitEditLink.addEventListener("click", () => {
-      if (OPEN_LIMIT_EDITORS.has(c.id)) {
-        OPEN_LIMIT_EDITORS.delete(c.id);
-        LIMIT_DRAFTS.delete(c.id);
-      } else {
-        OPEN_LIMIT_EDITORS.add(c.id);
-        if (!LIMIT_DRAFTS.has(c.id)) LIMIT_DRAFTS.set(c.id, bytesToUnit(c.dataLimitBytes));
-      }
-      editorBox.style.display = OPEN_LIMIT_EDITORS.has(c.id) ? "flex" : "none";
-    });
-
     limitRow.appendChild(limitLabel);
-    limitRow.appendChild(limitEditLink);
-
-    const editorBox = document.createElement("div");
-    editorBox.className = "limit-editor";
-    const isOpen = OPEN_LIMIT_EDITORS.has(c.id);
-    editorBox.style.display = isOpen ? "flex" : "none";
-    const draft = LIMIT_DRAFTS.get(c.id) || bytesToUnit(c.dataLimitBytes);
-
-    const valueInput = document.createElement("input");
-    valueInput.type = "number";
-    valueInput.min = "0";
-    valueInput.step = "any";
-    valueInput.placeholder = "Unlimited";
-    valueInput.className = "limit-value-input";
-    valueInput.value = draft.value;
-    valueInput.addEventListener("input", () => {
-      LIMIT_DRAFTS.set(c.id, { value: valueInput.value, unit: unitSelect.value });
-    });
-
-    const unitSelect = document.createElement("select");
-    unitSelect.className = "limit-unit-select";
-    ["MB", "GB", "TB"].forEach((u) => {
-      const opt = document.createElement("option");
-      opt.value = u;
-      opt.textContent = u;
-      if (u === draft.unit) opt.selected = true;
-      unitSelect.appendChild(opt);
-    });
-    unitSelect.addEventListener("change", () => {
-      LIMIT_DRAFTS.set(c.id, { value: valueInput.value, unit: unitSelect.value });
-    });
-
-    const saveLimitBtn = document.createElement("button");
-    saveLimitBtn.type = "button";
-    saveLimitBtn.textContent = "Save";
-    saveLimitBtn.addEventListener("click", () =>
-      saveLimit(c.id, valueInput.value.trim(), unitSelect.value, saveLimitBtn)
-    );
-
-    const clearLimitBtn = document.createElement("button");
-    clearLimitBtn.className = "secondary";
-    clearLimitBtn.type = "button";
-    clearLimitBtn.textContent = "Unlimited";
-    clearLimitBtn.addEventListener("click", () => saveLimit(c.id, "", unitSelect.value, clearLimitBtn));
-
-    editorBox.appendChild(valueInput);
-    editorBox.appendChild(unitSelect);
-    editorBox.appendChild(saveLimitBtn);
-    editorBox.appendChild(clearLimitBtn);
 
     // ---- expiry row ----
     const expiryRow = document.createElement("div");
     expiryRow.className = "client-limit-row";
-
     const expiryLabel = document.createElement("span");
     if (!c.expiresAt) {
       expiryLabel.textContent = "No expiry";
@@ -490,54 +660,7 @@ function render(clients, usage) {
       const remainingMs = Date.parse(c.expiresAt) - Date.now();
       expiryLabel.textContent = `Expires in ${formatRemaining(remainingMs)} · ${formatDate(c.expiresAt)}`;
     }
-
-    const expiryEditLink = document.createElement("button");
-    expiryEditLink.className = "limit-edit-link";
-    expiryEditLink.type = "button";
-    expiryEditLink.textContent = "Edit";
-    expiryEditLink.addEventListener("click", () => {
-      if (OPEN_EXPIRY_EDITORS.has(c.id)) {
-        OPEN_EXPIRY_EDITORS.delete(c.id);
-        EXPIRY_DRAFTS.delete(c.id);
-      } else {
-        OPEN_EXPIRY_EDITORS.add(c.id);
-        if (!EXPIRY_DRAFTS.has(c.id)) EXPIRY_DRAFTS.set(c.id, "");
-      }
-      expiryEditorBox.style.display = OPEN_EXPIRY_EDITORS.has(c.id) ? "flex" : "none";
-    });
-
     expiryRow.appendChild(expiryLabel);
-    expiryRow.appendChild(expiryEditLink);
-
-    const expiryEditorBox = document.createElement("div");
-    expiryEditorBox.className = "limit-editor";
-    expiryEditorBox.style.display = OPEN_EXPIRY_EDITORS.has(c.id) ? "flex" : "none";
-
-    const daysInput = document.createElement("input");
-    daysInput.type = "number";
-    daysInput.min = "1";
-    daysInput.step = "1";
-    daysInput.placeholder = "Days from today";
-    daysInput.className = "limit-value-input";
-    daysInput.value = EXPIRY_DRAFTS.get(c.id) || "";
-    daysInput.addEventListener("input", () => {
-      EXPIRY_DRAFTS.set(c.id, daysInput.value);
-    });
-
-    const saveExpiryBtn = document.createElement("button");
-    saveExpiryBtn.type = "button";
-    saveExpiryBtn.textContent = "Save";
-    saveExpiryBtn.addEventListener("click", () => saveExpiry(c.id, daysInput.value.trim(), saveExpiryBtn));
-
-    const clearExpiryBtn = document.createElement("button");
-    clearExpiryBtn.className = "secondary";
-    clearExpiryBtn.type = "button";
-    clearExpiryBtn.textContent = "No expiry";
-    clearExpiryBtn.addEventListener("click", () => saveExpiry(c.id, "", clearExpiryBtn));
-
-    expiryEditorBox.appendChild(daysInput);
-    expiryEditorBox.appendChild(saveExpiryBtn);
-    expiryEditorBox.appendChild(clearExpiryBtn);
 
     // ---- UUID row ----
     const uuidRow = document.createElement("div");
@@ -545,54 +668,7 @@ function render(clients, usage) {
     const uuidLabel = document.createElement("span");
     uuidLabel.className = "uuid-full";
     uuidLabel.textContent = c.uuid;
-    const uuidEditLink = document.createElement("button");
-    uuidEditLink.className = "limit-edit-link";
-    uuidEditLink.type = "button";
-    uuidEditLink.textContent = "Edit";
-    uuidEditLink.addEventListener("click", () => {
-      if (OPEN_UUID_EDITORS.has(c.id)) {
-        OPEN_UUID_EDITORS.delete(c.id);
-        UUID_DRAFTS.delete(c.id);
-      } else {
-        OPEN_UUID_EDITORS.add(c.id);
-        if (!UUID_DRAFTS.has(c.id)) UUID_DRAFTS.set(c.id, c.uuid);
-      }
-      uuidEditorBox.style.display = OPEN_UUID_EDITORS.has(c.id) ? "flex" : "none";
-    });
     uuidRow.appendChild(uuidLabel);
-    uuidRow.appendChild(uuidEditLink);
-
-    const uuidEditorBox = document.createElement("div");
-    uuidEditorBox.className = "limit-editor uuid-editor";
-    uuidEditorBox.style.display = OPEN_UUID_EDITORS.has(c.id) ? "flex" : "none";
-
-    const uuidInput = document.createElement("input");
-    uuidInput.type = "text";
-    uuidInput.spellcheck = false;
-    uuidInput.autocomplete = "off";
-    uuidInput.placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
-    uuidInput.className = "uuid-input";
-    uuidInput.value = UUID_DRAFTS.has(c.id) ? UUID_DRAFTS.get(c.id) : c.uuid;
-    uuidInput.addEventListener("input", () => UUID_DRAFTS.set(c.id, uuidInput.value));
-
-    const saveUuidBtn = document.createElement("button");
-    saveUuidBtn.type = "button";
-    saveUuidBtn.textContent = "Save";
-    saveUuidBtn.addEventListener("click", () => saveUuid(c.id, uuidInput.value.trim(), saveUuidBtn));
-
-    const randomUuidBtn = document.createElement("button");
-    randomUuidBtn.className = "secondary";
-    randomUuidBtn.type = "button";
-    randomUuidBtn.textContent = "Random";
-    randomUuidBtn.addEventListener("click", () => {
-      const v = crypto.randomUUID();
-      uuidInput.value = v;
-      UUID_DRAFTS.set(c.id, v);
-    });
-
-    uuidEditorBox.appendChild(uuidInput);
-    uuidEditorBox.appendChild(saveUuidBtn);
-    uuidEditorBox.appendChild(randomUuidBtn);
 
     // ---- actions: icon + visible label, so first-time users know what each does ----
     const actions = document.createElement("div");
@@ -621,6 +697,10 @@ function render(clients, usage) {
     });
     deleteBtn.addEventListener("click", () => deleteClient(c.id));
 
+    const { btn: editBtn } = iconBtn({ icon: ICONS.edit, label: "Edit", ariaLabel: "Edit this config" });
+    editBtn.addEventListener("click", () => openEditModal(c));
+
+    actions.appendChild(editBtn);
     actions.appendChild(qrBtn);
     actions.appendChild(copyBtn);
     actions.appendChild(subBtn);
@@ -643,62 +723,12 @@ function render(clients, usage) {
     card.appendChild(stats);
     if (usageBarTrack) card.appendChild(usageBarTrack);
     card.appendChild(limitRow);
-    card.appendChild(editorBox);
     card.appendChild(expiryRow);
-    card.appendChild(expiryEditorBox);
     card.appendChild(uuidRow);
-    card.appendChild(uuidEditorBox);
     card.appendChild(actions);
     card.appendChild(resetRow);
     list.appendChild(card);
   });
-}
-
-async function saveLimit(clientId, rawValue, unit, btn) {
-  btn.disabled = true;
-  try {
-    const dataLimitBytes = rawValue ? Math.round(parseFloat(rawValue) * UNIT_BYTES[unit]) : null;
-    if (rawValue && (!Number.isFinite(dataLimitBytes) || dataLimitBytes <= 0)) {
-      alert("Enter a valid positive number.");
-      return;
-    }
-    await api("/api/clients/" + clientId, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ dataLimitBytes }),
-    });
-    OPEN_LIMIT_EDITORS.delete(clientId);
-    LIMIT_DRAFTS.delete(clientId);
-    await loadClients();
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-// Sets the expiry to N days from today (renewal), or removes it when rawValue is empty.
-async function saveExpiry(clientId, rawValue, btn) {
-  btn.disabled = true;
-  try {
-    const expiryDays = rawValue ? parseFloat(rawValue) : null;
-    if (rawValue && (!Number.isFinite(expiryDays) || expiryDays <= 0)) {
-      alert("Enter a valid positive number of days.");
-      return;
-    }
-    const res = await api("/api/clients/" + clientId, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ expiryDays }),
-    });
-    if (!res.ok) {
-      alert("Could not save the expiry.");
-      return;
-    }
-    OPEN_EXPIRY_EDITORS.delete(clientId);
-    EXPIRY_DRAFTS.delete(clientId);
-    await loadClients();
-  } finally {
-    btn.disabled = false;
-  }
 }
 
 // Switches a config off (disabled=true) or back on (disabled=false). The server
@@ -715,34 +745,6 @@ async function toggleDisabled(clientId, disabled, btn) {
       alert("Could not change the config state.");
       return;
     }
-    await loadClients();
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-// Replaces a config's UUID. The old link stops working immediately; usage, limit,
-// expiry and the subscription link are unchanged.
-async function saveUuid(clientId, rawValue, btn) {
-  if (!UUID_RE.test(rawValue)) {
-    alert("Enter a valid UUID (8-4-4-4-12 hex characters).");
-    return;
-  }
-  if (!confirm("Change this UUID? The old config link will stop working right away.")) return;
-  btn.disabled = true;
-  try {
-    const res = await api("/api/clients/" + clientId, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ uuid: rawValue }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      alert(data.error || "Could not save the UUID.");
-      return;
-    }
-    OPEN_UUID_EDITORS.delete(clientId);
-    UUID_DRAFTS.delete(clientId);
     await loadClients();
   } finally {
     btn.disabled = false;

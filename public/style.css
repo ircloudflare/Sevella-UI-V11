@@ -555,3 +555,16 @@ button.danger {
 .uuid-input { flex: 1 1 260px; min-width: 0; font-family: var(--font-mono); font-size: 12px; }
 .uuid-full { font-family: var(--font-mono); font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
 .uuid-editor { flex-wrap: wrap; }
+
+/* ---- edit window ---- */
+.edit-modal { max-width: 440px; max-height: calc(100vh - 48px); overflow-y: auto; }
+.edit-field { margin-bottom: 14px; }
+.edit-label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 6px; }
+.edit-hint { margin: 6px 0 0; font-size: 11px; color: var(--muted-dim); line-height: 1.5; }
+.edit-inline { display: flex; gap: 8px; align-items: center; }
+.edit-inline input[type=number] { flex: 1 1 auto; min-width: 0; }
+.edit-inline .uuid-input { flex: 1 1 auto; }
+.edit-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; white-space: nowrap; cursor: pointer; }
+.edit-modal > .edit-check { margin-bottom: 14px; }
+.edit-error { margin: 0 0 12px; font-size: 12px; color: var(--danger); }
+.edit-footer { display: flex; justify-content: flex-end; gap: 8px; }

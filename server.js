@@ -772,8 +772,16 @@ app.patch("/api/clients/:id", (req, res) => {
   const hasExpiry = Object.prototype.hasOwnProperty.call(body, "expiryDays");
   const hasDisabled = Object.prototype.hasOwnProperty.call(body, "disabled");
   const hasUuid = Object.prototype.hasOwnProperty.call(body, "uuid");
-  if (!hasLimit && !hasExpiry && !hasDisabled && !hasUuid) {
+  const hasLabel = Object.prototype.hasOwnProperty.call(body, "label");
+  if (!hasLimit && !hasExpiry && !hasDisabled && !hasUuid && !hasLabel) {
     return res.status(400).json({ error: "nothing to update" });
+  }
+  let labelResult;
+  if (hasLabel) {
+    labelResult = String(body.label == null ? "" : body.label).trim();
+    if (!labelResult || labelResult.length > 100) {
+      return res.status(400).json({ error: "label must be 1-100 characters" });
+    }
   }
   if (hasDisabled && typeof body.disabled !== "boolean") {
     return res.status(400).json({ error: "disabled must be true or false" });
@@ -808,6 +816,7 @@ app.patch("/api/clients/:id", (req, res) => {
     }
     client.uuid = next;
   }
+  if (hasLabel) client.label = labelResult;
   if (hasDisabled) client.disabled = body.disabled;
   if (hasLimit) client.dataLimitBytes = limitResult;
   if (hasExpiry) {
@@ -825,6 +834,7 @@ app.patch("/api/clients/:id", (req, res) => {
     expired: isExpired(client),
     disabled: isDisabled(client),
     uuid: client.uuid,
+    label: client.label,
   });
 });
 
