@@ -12,6 +12,10 @@ const LIMIT_DRAFTS = new Map(); // clientId -> { value: string, unit: "MB"|"GB"|
 // Same idea for the "edit expiry" boxes.
 const OPEN_EXPIRY_EDITORS = new Set();
 const EXPIRY_DRAFTS = new Map(); // clientId -> days as typed (string)
+// Same idea for the "edit UUID" boxes.
+const OPEN_UUID_EDITORS = new Set();
+const UUID_DRAFTS = new Map(); // clientId -> UUID as typed (string)
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // The QR code now lives in a single modal appended to <body>, outside the
 // #list subtree that render() tears down and rebuilds every ~5s. That means
@@ -535,6 +539,61 @@ function render(clients, usage) {
     expiryEditorBox.appendChild(saveExpiryBtn);
     expiryEditorBox.appendChild(clearExpiryBtn);
 
+    // ---- UUID row ----
+    const uuidRow = document.createElement("div");
+    uuidRow.className = "client-limit-row";
+    const uuidLabel = document.createElement("span");
+    uuidLabel.className = "uuid-full";
+    uuidLabel.textContent = c.uuid;
+    const uuidEditLink = document.createElement("button");
+    uuidEditLink.className = "limit-edit-link";
+    uuidEditLink.type = "button";
+    uuidEditLink.textContent = "Edit";
+    uuidEditLink.addEventListener("click", () => {
+      if (OPEN_UUID_EDITORS.has(c.id)) {
+        OPEN_UUID_EDITORS.delete(c.id);
+        UUID_DRAFTS.delete(c.id);
+      } else {
+        OPEN_UUID_EDITORS.add(c.id);
+        if (!UUID_DRAFTS.has(c.id)) UUID_DRAFTS.set(c.id, c.uuid);
+      }
+      uuidEditorBox.style.display = OPEN_UUID_EDITORS.has(c.id) ? "flex" : "none";
+    });
+    uuidRow.appendChild(uuidLabel);
+    uuidRow.appendChild(uuidEditLink);
+
+    const uuidEditorBox = document.createElement("div");
+    uuidEditorBox.className = "limit-editor uuid-editor";
+    uuidEditorBox.style.display = OPEN_UUID_EDITORS.has(c.id) ? "flex" : "none";
+
+    const uuidInput = document.createElement("input");
+    uuidInput.type = "text";
+    uuidInput.spellcheck = false;
+    uuidInput.autocomplete = "off";
+    uuidInput.placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
+    uuidInput.className = "uuid-input";
+    uuidInput.value = UUID_DRAFTS.has(c.id) ? UUID_DRAFTS.get(c.id) : c.uuid;
+    uuidInput.addEventListener("input", () => UUID_DRAFTS.set(c.id, uuidInput.value));
+
+    const saveUuidBtn = document.createElement("button");
+    saveUuidBtn.type = "button";
+    saveUuidBtn.textContent = "Save";
+    saveUuidBtn.addEventListener("click", () => saveUuid(c.id, uuidInput.value.trim(), saveUuidBtn));
+
+    const randomUuidBtn = document.createElement("button");
+    randomUuidBtn.className = "secondary";
+    randomUuidBtn.type = "button";
+    randomUuidBtn.textContent = "Random";
+    randomUuidBtn.addEventListener("click", () => {
+      const v = crypto.randomUUID();
+      uuidInput.value = v;
+      UUID_DRAFTS.set(c.id, v);
+    });
+
+    uuidEditorBox.appendChild(uuidInput);
+    uuidEditorBox.appendChild(saveUuidBtn);
+    uuidEditorBox.appendChild(randomUuidBtn);
+
     // ---- actions: icon + visible label, so first-time users know what each does ----
     const actions = document.createElement("div");
     actions.className = "client-actions";
@@ -587,6 +646,8 @@ function render(clients, usage) {
     card.appendChild(editorBox);
     card.appendChild(expiryRow);
     card.appendChild(expiryEditorBox);
+    card.appendChild(uuidRow);
+    card.appendChild(uuidEditorBox);
     card.appendChild(actions);
     card.appendChild(resetRow);
     list.appendChild(card);
@@ -660,6 +721,34 @@ async function toggleDisabled(clientId, disabled, btn) {
   }
 }
 
+// Replaces a config's UUID. The old link stops working immediately; usage, limit,
+// expiry and the subscription link are unchanged.
+async function saveUuid(clientId, rawValue, btn) {
+  if (!UUID_RE.test(rawValue)) {
+    alert("Enter a valid UUID (8-4-4-4-12 hex characters).");
+    return;
+  }
+  if (!confirm("Change this UUID? The old config link will stop working right away.")) return;
+  btn.disabled = true;
+  try {
+    const res = await api("/api/clients/" + clientId, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ uuid: rawValue }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || "Could not save the UUID.");
+      return;
+    }
+    OPEN_UUID_EDITORS.delete(clientId);
+    UUID_DRAFTS.delete(clientId);
+    await loadClients();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function resetUsage(clientId, btn) {
   if (!confirm("Reset usage for this config? If it was capped, it will reconnect immediately.")) return;
   btn.disabled = true;
@@ -684,6 +773,12 @@ async function createClient() {
     alert("Enter a valid positive limit, or leave it empty for unlimited.");
     return;
   }
+  const uuidInputEl = document.getElementById("newUuid");
+  const rawUuid = uuidInputEl.value.trim();
+  if (rawUuid && !UUID_RE.test(rawUuid)) {
+    alert("Enter a valid UUID (8-4-4-4-12 hex characters), or leave it empty.");
+    return;
+  }
   const daysInput = document.getElementById("newDays");
   const rawDays = daysInput.value.trim();
   const expiryDays = rawDays ? parseFloat(rawDays) : null;
@@ -694,12 +789,18 @@ async function createClient() {
   const btn = document.getElementById("createBtn");
   btn.disabled = true;
   try {
-    await api("/api/clients", {
+    const createRes = await api("/api/clients", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ label, dataLimitBytes, expiryDays }),
+      body: JSON.stringify({ label, dataLimitBytes, expiryDays, uuid: rawUuid || null }),
     });
+    if (!createRes.ok) {
+      const data = await createRes.json().catch(() => ({}));
+      alert(data.error || "Could not create the config.");
+      return;
+    }
     input.value = "";
+    uuidInputEl.value = "";
     limitValueInput.value = "";
     daysInput.value = "";
     // the server pushes an updated snapshot over the websocket right away;

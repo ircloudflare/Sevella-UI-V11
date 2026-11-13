@@ -184,6 +184,22 @@ function parseExpiryDays(raw) {
   return n;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Parses a raw uuid value from a request body.
+// Returns: a lower-cased valid UUID, null (empty = generate a random one),
+// or the string "invalid" if the value is present but not a UUID.
+function parseUuid(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  if (s === "") return null;
+  return UUID_RE.test(s) ? s.toLowerCase() : "invalid";
+}
+
+function uuidInUse(uuid, exceptId) {
+  return clients.some((c) => c.id !== exceptId && String(c.uuid).toLowerCase() === uuid);
+}
+
 function expiryFromDays(days) {
   if (days == null) return null;
   return new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
@@ -705,9 +721,16 @@ app.post("/api/clients", (req, res) => {
   if (daysResult === "invalid") {
     return res.status(400).json({ error: "expiryDays must be a positive number or null" });
   }
+  const uuidResult = parseUuid(req.body && req.body.uuid);
+  if (uuidResult === "invalid") {
+    return res.status(400).json({ error: "uuid is not a valid UUID" });
+  }
+  if (uuidResult && uuidInUse(uuidResult, null)) {
+    return res.status(409).json({ error: "uuid is already used by another config" });
+  }
   const client = {
     id: crypto.randomUUID(),
-    uuid: crypto.randomUUID(),
+    uuid: uuidResult || crypto.randomUUID(),
     label,
     createdAt: new Date().toISOString(),
     ...freshUsage(),
@@ -748,7 +771,8 @@ app.patch("/api/clients/:id", (req, res) => {
   const hasLimit = Object.prototype.hasOwnProperty.call(body, "dataLimitBytes");
   const hasExpiry = Object.prototype.hasOwnProperty.call(body, "expiryDays");
   const hasDisabled = Object.prototype.hasOwnProperty.call(body, "disabled");
-  if (!hasLimit && !hasExpiry && !hasDisabled) {
+  const hasUuid = Object.prototype.hasOwnProperty.call(body, "uuid");
+  if (!hasLimit && !hasExpiry && !hasDisabled && !hasUuid) {
     return res.status(400).json({ error: "nothing to update" });
   }
   if (hasDisabled && typeof body.disabled !== "boolean") {
@@ -771,6 +795,19 @@ app.patch("/api/clients/:id", (req, res) => {
     }
   }
 
+  if (hasUuid) {
+    // Empty value = generate a fresh random UUID. Usage, limit and expiry stay
+    // attached to the client id, so only the connection link changes.
+    const parsed = parseUuid(body.uuid);
+    if (parsed === "invalid") {
+      return res.status(400).json({ error: "uuid is not a valid UUID" });
+    }
+    const next = parsed || crypto.randomUUID();
+    if (uuidInUse(next, client.id)) {
+      return res.status(409).json({ error: "uuid is already used by another config" });
+    }
+    client.uuid = next;
+  }
   if (hasDisabled) client.disabled = body.disabled;
   if (hasLimit) client.dataLimitBytes = limitResult;
   if (hasExpiry) {
@@ -787,6 +824,7 @@ app.patch("/api/clients/:id", (req, res) => {
     expiresAt: client.expiresAt,
     expired: isExpired(client),
     disabled: isDisabled(client),
+    uuid: client.uuid,
   });
 });
 

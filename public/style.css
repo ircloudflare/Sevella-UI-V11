@@ -550,3 +550,8 @@ button.danger {
 @media (prefers-reduced-motion: reduce) {
   .switch, .switch-knob { transition: none; }
 }
+
+/* ---- UUID fields ---- */
+.uuid-input { flex: 1 1 260px; min-width: 0; font-family: var(--font-mono); font-size: 12px; }
+.uuid-full { font-family: var(--font-mono); font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.uuid-editor { flex-wrap: wrap; }

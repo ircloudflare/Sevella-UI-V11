@@ -28,6 +28,7 @@
       </div>
       <div class="row">
         <input type="text" id="newLabel" placeholder="Label (e.g. My phone)" />
+        <input type="text" id="newUuid" placeholder="Custom UUID (optional)" spellcheck="false" autocomplete="off" class="uuid-input" />
         <input type="number" id="newLimitValue" placeholder="Limit (optional)" min="0" step="any" class="limit-value-input" />
         <select id="newLimitUnit" class="limit-unit-select">
           <option value="MB">MB</option>
@@ -37,7 +38,7 @@
         <input type="number" id="newDays" placeholder="Days (optional)" min="1" step="1" class="limit-value-input" />
         <button id="createBtn">+ Create</button>
       </div>
-      <p class="sub" style="margin:8px 0 0;">Leave the limit or the days empty for unlimited.</p>
+      <p class="sub" style="margin:8px 0 0;">Leave the limit or the days empty for unlimited. Leave the UUID empty to generate a random one.</p>
     </div>
 
     <div id="list"></div>
